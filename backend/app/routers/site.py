@@ -1,10 +1,15 @@
-"""站点管理接口：维护采集站点，覆盖提交校验、激活站点、暂停站点等动作。"""
+"""站点管理接口：维护采集站点，覆盖提交校验、激活站点、暂停站点等动作。
+
+列表/明细/动作/导出的路径与返回结构保持不变；数据已改为 SQLite 持久化，
+并发冲突（版本过期、写锁竞争）统一返回 409 与可读回执。
+"""
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.db import ConflictError
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.site import SiteService
 
@@ -14,6 +19,21 @@ service = SiteService()
 
 LIST_FIELDS = ["站点编号", "域名地址", "站点类型", "请求方式", "字符编码", "请求头模板", "Cookie配置", "站点负责人"]
 STATUSES = ["草稿", "待校验", "已激活", "已暂停"]
+
+
+def _conflict(exc: ConflictError) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={"message": exc.message, "current_version": exc.current_version},
+    )
+
+
+# 静态路径必须声明在 /{entry_id} 之前，否则 export 会被当成站点 id 解析。
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出站点管理清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "site", "total": total, "items": items}
 
 
 @router.get("", response_model=PageResult[dict])
@@ -41,8 +61,11 @@ def get_entry(entry_id: int) -> dict:
 
 @router.post("", response_model=ActionResult)
 def create_entry(payload: EntryPayload) -> ActionResult:
-    """登记一条采集站点，缺字段时说明原因而不是静默丢弃。"""
-    entry, missing = service.create_entry(payload.values)
+    """登记一条采集站点，缺字段或编号重复时说明原因而不是静默丢弃。"""
+    try:
+        entry, missing = service.create_entry(payload.values)
+    except ConflictError as exc:
+        raise _conflict(exc) from exc
     if missing:
         return ActionResult(ok=False, message=f"缺少必填字段：{'、'.join(missing)}")
     return ActionResult(ok=True, message="采集站点已登记", entry=entry)
@@ -52,14 +75,12 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     """对单条采集站点执行提交校验、激活站点、暂停站点；不允许的动作会被拦下并说明原因。"""
     action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
+    try:
+        entry, message = service.run_action(
+            entry_id, action, expected_version=payload.version
+        )
+    except ConflictError as exc:
+        raise _conflict(exc) from exc
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出站点管理清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "site", "total": total, "items": items}

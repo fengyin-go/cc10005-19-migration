@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { request } from '@/api/client'
+import { readError, request } from '@/api/client'
+import { CreateForm, type CreateField } from '@/components/CreateForm'
 
 const ENDPOINT = '/api/site'
 const columns = [
@@ -24,28 +25,31 @@ const statuses = [
   "已激活",
   "已暂停"
 ]
-const stats = [
-  {
-    "label": "采集站点总数",
-    "value": 0
-  },
-  {
-    "label": "已激活站点",
-    "value": 0
-  },
-  {
-    "label": "待校验站点",
-    "value": 0
-  }
+
+const createFields: CreateField[] = [
+  { name: '站点编号', label: '站点编号', required: true, placeholder: '如 SITE-1001' },
+  { name: '域名地址', label: '域名地址', required: true, placeholder: '如 www.example.com' },
+  { name: '站点类型', label: '站点类型', required: true, placeholder: '如 门户 / 论坛' },
+  { name: '请求方式', label: '请求方式', placeholder: 'GET / POST' },
+  { name: '字符编码', label: '字符编码', placeholder: '如 UTF-8' },
+  { name: '站点负责人', label: '站点负责人' },
 ]
 
-type Row = Record<string, string | number | null>
+const emptyForm = (): Record<string, string> =>
+  Object.fromEntries(createFields.map((field) => [field.name, '']))
+
+type Row = Record<string, string | number | null | boolean>
 
 export default function SiteView() {
   const [rows, setRows] = useState<Row[]>([])
   const [total, setTotal] = useState(0)
   const [errorMessage, setErrorMessage] = useState('')
+  const [successMessage, setSuccessMessage] = useState('')
+  const [conflictMessage, setConflictMessage] = useState('')
   const [filters, setFilters] = useState<Record<string, string>>({})
+  const [formOpen, setFormOpen] = useState(false)
+  const [formValues, setFormValues] = useState<Record<string, string>>(emptyForm)
+  const [submitting, setSubmitting] = useState(false)
   const filterFields = useMemo(() => columns.slice(0, 3), [])
 
   const reload = useCallback(async () => {
@@ -70,17 +74,60 @@ export default function SiteView() {
 
   async function runAction(action: string, row: Row) {
     setErrorMessage('')
+    setConflictMessage('')
+    setSuccessMessage('')
     try {
+      // 带上行版本号：并发修改后服务端会回 409，提示刷新而不是静默覆盖。
       const response = await request(`${ENDPOINT}/${row.id}/actions`, {
         method: 'POST',
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ values: { action }, version: row.version ?? null }),
       })
-      if (!response.ok) {
-        throw new Error('站点管理动作未生效，请稍后重试')
+      if (response.status === 409) {
+        const apiError = await readError(response)
+        setConflictMessage(apiError.message)
+        await reload()
+        return
       }
+      const payload = await response.json()
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.message ?? '站点管理动作未生效，请稍后重试')
+      }
+      setSuccessMessage(payload.message ?? '动作已生效')
       await reload()
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : '站点管理操作失败')
+    }
+  }
+
+  async function submitCreate() {
+    setErrorMessage('')
+    setConflictMessage('')
+    setSubmitting(true)
+    try {
+      const values = Object.fromEntries(
+        Object.entries(formValues).filter(([, value]) => value.trim() !== '')
+      )
+      const response = await request(ENDPOINT, {
+        method: 'POST',
+        body: JSON.stringify({ values }),
+      })
+      if (response.status === 409) {
+        const apiError = await readError(response)
+        setConflictMessage(apiError.message)
+        return
+      }
+      const payload = await response.json()
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.message ?? '登记失败')
+      }
+      setFormOpen(false)
+      setFormValues(emptyForm())
+      setSuccessMessage(payload.message ?? '采集站点已登记，已写入 SQLite，重启后仍可核对')
+      await reload()
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : '采集站点登记失败')
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -89,10 +136,10 @@ export default function SiteView() {
       <header className="page-head">
         <div>
           <h2>站点管理管理</h2>
-          <p className="page-desc">维护采集站点的输入、执行约束与结果记录，为站点管理提供可验证的数据工程流程。</p>
+          <p className="page-desc">维护采集站点的输入、执行约束与结果记录；登记数据落在 SQLite，服务重启后仍可核对。</p>
         </div>
         <div className="page-actions">
-          <button className="btn primary" type="button" onClick={() => setErrorMessage('采集站点登记入口尚未接入审批流')}>
+          <button className="btn primary" type="button" onClick={() => { setFormOpen(true); setErrorMessage('') }}>
             登记采集站点
           </button>
           <button className="btn" type="button" onClick={() => window.open(`${ENDPOINT}/export`, '_blank')}>
@@ -101,14 +148,14 @@ export default function SiteView() {
         </div>
       </header>
 
-      <div className="stat-row">
-        {stats.map((item) => (
-          <article key={item.label} className="stat-card">
-            <span className="stat-label">{item.label}</span>
-            <strong className="stat-value">{item.value}</strong>
-          </article>
-        ))}
-      </div>
+      {conflictMessage && (
+        <div className="conflict-box" role="alert">
+          <strong>并发冲突：</strong>{conflictMessage}
+          <button className="link" type="button" style={{ marginLeft: 8 }} onClick={() => void reload()}>
+            刷新列表
+          </button>
+        </div>
+      )}
 
       <form className="filter-bar" onSubmit={(event) => { event.preventDefault(); void reload() }}>
         {filterFields.map((field) => (
@@ -117,7 +164,15 @@ export default function SiteView() {
             <input
               value={filters[field] ?? ''}
               placeholder={`按${field}检索`}
-              onChange={(event) => setFilters((prev) => ({ ...prev, [field]: event.target.value }))}
+              onChange={(event) => setFilters((prev) => {
+                const next = { ...prev }
+                if (event.target.value) {
+                  next[field] = event.target.value
+                } else {
+                  delete next[field]
+                }
+                return next
+              })}
             />
           </label>
         ))}
@@ -129,6 +184,8 @@ export default function SiteView() {
         <thead>
           <tr>
             {columns.map((column) => <th key={column}>{column}</th>)}
+            <th>状态</th>
+            <th>版本</th>
             <th>可执行动作</th>
           </tr>
         </thead>
@@ -136,6 +193,8 @@ export default function SiteView() {
           {rows.map((row) => (
             <tr key={String(row.id)}>
               {columns.map((column) => <td key={column}>{row[column] ?? '—'}</td>)}
+              <td>{String(row.status ?? '')}</td>
+              <td>v{String(row.version ?? 1)}</td>
               <td className="row-actions">
                 {actions.map((action) => (
                   <button key={action} className="link" type="button" onClick={() => void runAction(action, row)}>
@@ -147,16 +206,28 @@ export default function SiteView() {
           ))}
           {rows.length === 0 && (
             <tr>
-              <td className="empty-state" colSpan={columns.length + 1}>暂无站点管理数据，可先登记采集站点</td>
+              <td className="empty-state" colSpan={columns.length + 3}>暂无站点管理数据，可先登记采集站点</td>
             </tr>
           )}
         </tbody>
       </table>
 
       <footer className="page-foot">
-        <span>共 {total} 条站点管理记录</span>
+        <span>共 {total} 条站点管理记录{statuses.length > 0 ? `（状态：${statuses.join(' / ')}）` : ''}</span>
+        {successMessage && <span className="success-text">{successMessage}</span>}
         {errorMessage && <span className="error-text">{errorMessage}</span>}
       </footer>
+
+      <CreateForm
+        title="登记采集站点"
+        open={formOpen}
+        fields={createFields}
+        values={formValues}
+        submitting={submitting}
+        onChange={(name, value) => setFormValues((prev) => ({ ...prev, [name]: value }))}
+        onSubmit={() => void submitCreate()}
+        onClose={() => setFormOpen(false)}
+      />
     </section>
   )
 }

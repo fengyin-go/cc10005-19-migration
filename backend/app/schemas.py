@@ -19,12 +19,23 @@ class ActionResult(BaseModel):
     ok: bool
     message: str
     entry: dict[str, Any] | None = None
+    # 并发冲突时回传服务端当前版本，前端据此刷新后再提交。
+    current_version: int | None = None
+
+
+class BindingPayload(BaseModel):
+    """凭证绑定/转交站点的请求体。"""
+
+    site_id: int
+    version: int | None = None
 
 
 class EntryPayload(BaseModel):
     """登记或修改一条业务记录时提交的字段集合。"""
 
     values: dict[str, Any] = Field(default_factory=dict)
+    # 乐观并发版本：动作接口携带后，服务端发现版本过期会返回 409 冲突回执。
+    version: int | None = None
     remark: str | None = None
 
 

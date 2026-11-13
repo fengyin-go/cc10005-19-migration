@@ -5,9 +5,16 @@ services:
       - "8000:8000"
     environment:
       - APP_ENV=local
+      # SQLite 正式存储落在挂载卷上，容器重启/重建后站点与凭证数据仍在。
+      - APP_DB_PATH=/data/app.sqlite3
+    volumes:
+      - sqlite_data:/data
   frontend:
     build: ./frontend
     ports:
       - "5173:5173"
     depends_on:
       - backend
+
+volumes:
+  sqlite_data:

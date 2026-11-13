@@ -17,9 +17,50 @@
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/          每个业务模块一组接口
 │   ├── app/services/         业务规则与状态流转
-│   └── app/store.py          内存数据仓库与示例数据
+│   ├── app/db.py             SQLite 连接与版本化迁移
+│   ├── app/repositories.py   站点/凭证 SQL 访问层
+│   ├── app/legacy.py         内存快照迁移与重复/失联数据识别
+│   ├── import_legacy.py      历史快照导入 CLI
+│   ├── tests/                标准库 unittest 测试
+│   └── app/store.py          其余模块的内存数据仓库与示例数据
 ├── .gitignore
-└── docker-compose.yml
+└── docker-compose.yml      backend 的 SQLite 落在命名卷 sqlite_data
+```
+
+## SQLite 持久化（站点管理 + 登录凭证）
+
+站点与登录凭证已从进程内存迁移到 SQLite，作为服务部署环境的正式存储：
+登记、状态流转、凭证绑定/转交在服务重启后仍然可读。其余 16 个模块仍由内存仓库提供。
+
+- 数据库路径由环境变量 `APP_DB_PATH` 控制，默认 `backend/data/app.sqlite3`；
+  docker-compose 把它指向命名卷 `/data/app.sqlite3`。
+- 结构升级走 `schema_migrations` 版本表 + `PRAGMA user_version`：每个版本在一个
+  事务内完成，升级中断整体回滚，下次启动从断点继续，样例只在首次部署装载一次，
+  再次启动不会覆盖用户数据。库版本高于程序版本时拒绝启动。
+- 首次启动自动建库并装载内置样例。样例凭证的「目标站点」匹配不到任何站点编号，
+  因此只登记凭证不建绑定，问题写入 `migration_issues`，可在登录凭证页面顶部或
+  `GET /api/auth/migration-issues` 查看。
+- 历史内存快照用 `backend/import_legacy.py 快照.json` 导入；重复业务编号保留先进入
+  的一条、无法匹配目标站点的凭证不建立绑定，均登记到 `migration_issues`，绝不任意
+  合并到一条有效绑定；同一快照按内容哈希去重，可安全重复执行。
+- 站点与凭证的绑定关系与凭证本身在同一立即事务里提交，任一边写失败整体回滚。
+- 每条站点/凭证带 `version`，动作与绑定接口支持乐观并发：携带过期版本会收到
+  `409` 冲突回执（含服务端当前版本 `current_version`），写锁竞争也统一转成 409。
+
+### 凭证绑定/转交接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/auth/{id}/bindings` | 请求体 `{site_id, version?}`；已绑他站即转交，冲突返回 409 |
+| DELETE | `/api/auth/{id}/bindings` | 解绑，凭证回到草稿；可带 `{version}` 做冲突校验 |
+| GET | `/api/auth/migration-issues` | 迁移遗留问题（重复编号、失联目标站点） |
+
+### 测试
+
+```bash
+make test          # 后端 unittest（17 个用例）+ 前端类型检查/构建
+# 或分开：
+cd backend && .venv/bin/python -m unittest discover -s tests -v
 ```
 
 ## 启动

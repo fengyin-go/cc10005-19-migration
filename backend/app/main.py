@@ -5,12 +5,17 @@
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.db import SCHEMA_VERSION, init_db
 from app.routers import ROUTERS
 from app.store import store
+
+logger = logging.getLogger("app")
 
 app = FastAPI(title="分布式网页采集调度系统", version="1.0.0")
 
@@ -26,10 +31,26 @@ for module in ROUTERS:
     app.include_router(module.router)
 
 
+@app.on_event("startup")
+def on_startup() -> None:
+    """启动即建库/升级：首次部署装载样例，再次启动只核对版本，不覆盖用户数据。"""
+    report = init_db()
+    logger.info("SQLite 初始化完成：%s", report)
+
+
 @app.get("/api/health")
 def health() -> dict[str, object]:
-    """健康检查：确认服务已经监听、示例数据已经就绪。"""
-    return {"ok": True, "app": settings.app_name, "modules": len(store.module_names())}
+    """健康检查：确认服务监听、SQLite 结构版本与内存模块均已就绪。"""
+    return {
+        "ok": True,
+        "app": settings.app_name,
+        "modules": len(store.module_names()),
+        "storage": {
+            "engine": "sqlite",
+            "path": settings.db_path,
+            "schema_version": SCHEMA_VERSION,
+        },
+    }
 
 
 @app.get("/api/overview")
